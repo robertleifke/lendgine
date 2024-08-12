@@ -7,14 +7,18 @@ import { Pair } from "./Pair.sol";
 
 import { ILendgine } from "./interfaces/ILendgine.sol";
 import { IMintCallback } from "./interfaces/callback/IMintCallback.sol";
+import { IPairMintCallback } from "./interfaces/callback/IPairMintCallback.sol";
 
 import { Balance } from "../libraries/Balance.sol";
 import { FullMath } from "../libraries/FullMath.sol";
 import { Position } from "./libraries/Position.sol";
 import { SafeTransferLib } from "../libraries/SafeTransferLib.sol";
+import { Payment } from "./Payment.sol";
 import { SafeCast } from "../libraries/SafeCast.sol";
+import { LendgineAddress } from "./libraries/LendgineAddress.sol";
+import { UD60x18, ud, mul, div, pow, sub } from "@prb/math/src/UD60x18.sol";
 
-contract Lendgine is ERC20, JumpRate, Pair, ILendgine {
+contract Lendgine is ERC20, JumpRate, Pair, ILendgine, IMintCallback, IPairMintCallback, Payment {
   using Position for mapping(address => Position.Info);
   using Position for Position.Info;
 
@@ -23,218 +27,272 @@ contract Lendgine is ERC20, JumpRate, Pair, ILendgine {
     //////////////////////////////////////////////////////////////*/
 
   event Mint(address indexed sender, uint256 collateral, uint256 shares, uint256 liquidity, address indexed to);
-
   event Burn(address indexed sender, uint256 collateral, uint256 shares, uint256 liquidity, address indexed to);
-
   event Deposit(address indexed sender, uint256 size, uint256 liquidity, address indexed to);
-
   event Withdraw(address indexed sender, uint256 size, uint256 liquidity, address indexed to);
-
   event AccrueInterest(uint256 timeElapsed, uint256 collateral, uint256 liquidity);
-
   event AccruePositionInterest(address indexed owner, uint256 rewardPerPosition);
-
   event Collect(address indexed owner, address indexed to, uint256 amount);
+  event AddLiquidity(
+    address indexed from,
+    address indexed lendgine,
+    uint256 liquidity,
+    uint256 size,
+    uint256 amount0,
+    uint256 amount1,
+    address indexed to
+  );
+  event RemoveLiquidity(
+    address indexed from,
+    address indexed lendgine,
+    uint256 liquidity,
+    uint256 size,
+    uint256 amount0,
+    uint256 amount1,
+    address indexed to
+  );
 
   /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
 
   error InputError();
-
   error CompleteUtilizationError();
-
   error InsufficientInputError();
-
   error InsufficientPositionError();
+  error AmountError();
+  error ValidationError();
+  error CollectError();
 
   /*//////////////////////////////////////////////////////////////
                           LENDGINE STORAGE
     //////////////////////////////////////////////////////////////*/
 
-  /// @inheritdoc ILendgine
   mapping(address => Position.Info) public override positions;
+  mapping(address => mapping(address => Position.Info)) public userPositions;
 
-  /// @inheritdoc ILendgine
   uint256 public override totalPositionSize;
-
-  /// @inheritdoc ILendgine
   uint256 public override totalLiquidityBorrowed;
-
-  /// @inheritdoc ILendgine
   uint256 public override rewardPerPositionStored;
-
-  /// @inheritdoc ILendgine
   uint256 public override lastUpdate;
 
-  /// @inheritdoc ILendgine
-  function mint(
-    address to,
-    uint256 collateral,
-    bytes calldata data
-  )
-    external
-    override
-    nonReentrant
-    returns (uint256 shares)
-  {
-    _accrueInterest();
+  /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
 
-    uint256 liquidity = convertCollateralToLiquidity(collateral);
-    shares = convertLiquidityToShare(liquidity);
-
-    if (collateral == 0 || liquidity == 0 || shares == 0) revert InputError();
-    if (liquidity > totalLiquidity) revert CompleteUtilizationError();
-    // next check is for the case when liquidity is borrowed but then was completely accrued
-    if (totalSupply > 0 && totalLiquidityBorrowed == 0) revert CompleteUtilizationError();
-
-    totalLiquidityBorrowed += liquidity;
-    (uint256 amount0, uint256 amount1) = burn(to, liquidity);
-    _mint(to, shares);
-
-    uint256 balanceBefore = Balance.balance(token1);
-    IMintCallback(msg.sender).mintCallback(collateral, amount0, amount1, liquidity, data);
-    uint256 balanceAfter = Balance.balance(token1);
-
-    if (balanceAfter < balanceBefore + collateral) revert InsufficientInputError();
-
-    emit Mint(msg.sender, collateral, shares, liquidity, to);
+  constructor(address _factory, address _weth) Payment(_weth) {
+    factory = _factory;
+    weth = _weth;
   }
 
-  /// @inheritdoc ILendgine
-  function burn(address to, bytes calldata data) external override nonReentrant returns (uint256 collateral) {
-    _accrueInterest();
+  /*//////////////////////////////////////////////////////////////
+                                MODIFIERS
+    //////////////////////////////////////////////////////////////*/
 
-    uint256 shares = balanceOf[address(this)];
-    uint256 liquidity = convertShareToLiquidity(shares);
-    collateral = convertLiquidityToCollateral(liquidity);
-
-    if (collateral == 0 || liquidity == 0 || shares == 0) revert InputError();
-
-    totalLiquidityBorrowed -= liquidity;
-    _burn(address(this), shares);
-    SafeTransferLib.safeTransfer(token1, to, collateral); // optimistically transfer
-    mint(liquidity, data);
-
-    emit Burn(msg.sender, collateral, shares, liquidity, to);
+  modifier checkDeadline(uint256 deadline) {
+    if (deadline < block.timestamp) revert InputError();
+    _;
   }
 
-  /// @inheritdoc ILendgine
-  function deposit(
-    address to,
-    uint256 liquidity,
-    bytes calldata data
-  )
-    external
-    override
-    nonReentrant
-    returns (uint256 size)
-  {
-    _accrueInterest();
+  /*//////////////////////////////////////////////////////////////
+                                CALLBACK
+    //////////////////////////////////////////////////////////////*/
 
-    uint256 _totalPositionSize = totalPositionSize; // SLOAD
-    uint256 totalLiquiditySupplied = totalLiquidity + totalLiquidityBorrowed;
-
-    size = Position.convertLiquidityToPosition(liquidity, totalLiquiditySupplied, _totalPositionSize);
-
-    if (liquidity == 0 || size == 0) revert InputError();
-    // next check is for the case when liquidity is borrowed but then was completely accrued
-    if (totalLiquiditySupplied == 0 && totalPositionSize > 0) revert CompleteUtilizationError();
-
-    positions.update(to, SafeCast.toInt256(size), rewardPerPositionStored);
-    totalPositionSize = _totalPositionSize + size;
-    mint(liquidity, data);
-
-    emit Deposit(msg.sender, size, liquidity, to);
+  struct PairMintCallbackData {
+    address token0;
+    address token1;
+    uint256 strike;
+    uint256 amount0;
+    uint256 amount1;
+    address payer;
   }
 
-  /// @inheritdoc ILendgine
-  function withdraw(
-    address to,
-    uint256 size
-  )
-    external
-    override
-    nonReentrant
-    returns (uint256 amount0, uint256 amount1, uint256 liquidity)
-  {
-    _accrueInterest();
+  function pairMintCallback(uint256, bytes calldata data) external override {
+    PairMintCallbackData memory decoded = abi.decode(data, (PairMintCallbackData));
 
-    uint256 _totalPositionSize = totalPositionSize; // SLOAD
-    uint256 _totalLiquidity = totalLiquidity; // SLOAD
-    uint256 totalLiquiditySupplied = _totalLiquidity + totalLiquidityBorrowed;
+    address lendgine = LendgineAddress.computeAddress(factory, decoded.token0, decoded.token1, decoded.strike);
+    if (lendgine != msg.sender) revert ValidationError();
 
-    Position.Info memory positionInfo = positions[msg.sender]; // SLOAD
-    liquidity = Position.convertPositionToLiquidity(size, totalLiquiditySupplied, _totalPositionSize);
-
-    if (liquidity == 0 || size == 0) revert InputError();
-
-    if (size > positionInfo.size) revert InsufficientPositionError();
-    if (liquidity > _totalLiquidity) revert CompleteUtilizationError();
-
-    positions.update(msg.sender, -SafeCast.toInt256(size), rewardPerPositionStored);
-    totalPositionSize -= size;
-    (amount0, amount1) = burn(to, liquidity);
-
-    emit Withdraw(msg.sender, size, liquidity, to);
+    if (decoded.amount0 > 0) Payment.pay(decoded.token0, decoded.payer, msg.sender, decoded.amount0);
+    if (decoded.amount1 > 0) Payment.pay(decoded.token1, decoded.payer, msg.sender, decoded.amount1);
   }
 
-  /// @inheritdoc ILendgine
-  function accrueInterest() external override nonReentrant {
-    _accrueInterest();
+  /*//////////////////////////////////////////////////////////////
+                           LIQUIDITY MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+  struct AddLiquidityParams {
+    address token0;
+    address token1;
+    uint256 strike;
+    uint256 liquidity;
+    uint256 amount0Min;
+    uint256 amount1Min;
+    uint256 sizeMin;
+    address recipient;
+    uint256 deadline;
   }
 
-  /// @inheritdoc ILendgine
-  function accruePositionInterest() external override nonReentrant {
-    _accrueInterest();
-    _accruePositionInterest(msg.sender);
-  }
+  function addLiquidity(AddLiquidityParams calldata params) external payable checkDeadline(params.deadline) {
+    address lendgine = LendgineAddress.computeAddress(factory, params.token0, params.token1, params.strike);
 
-  /// @inheritdoc ILendgine
-  function collect(address to, uint256 collateralRequested) external override nonReentrant returns (uint256 collateral) {
-    Position.Info storage position = positions[msg.sender]; // SLOAD
-    uint256 tokensOwed = position.tokensOwed;
+    uint256 r0 = ILendgine(lendgine).reserve0();
+    uint256 r1 = ILendgine(lendgine).reserve1();
+    uint256 totalLiquidity = ILendgine(lendgine).totalLiquidity();
 
-    collateral = collateralRequested > tokensOwed ? tokensOwed : collateralRequested;
+    uint256 amount0;
+    uint256 amount1;
 
-    if (collateral > 0) {
-      position.tokensOwed = tokensOwed - collateral; // SSTORE
-      SafeTransferLib.safeTransfer(token1, to, collateral);
+    if (totalLiquidity == 0) {
+      amount0 = params.amount0Min;
+      amount1 = params.amount1Min;
+    } else {
+      amount0 = FullMath.mulDivRoundingUp(params.liquidity, r0, totalLiquidity);
+      amount1 = FullMath.mulDivRoundingUp(params.liquidity, r1, totalLiquidity);
     }
 
-    emit Collect(msg.sender, to, collateral);
+    if (amount0 < params.amount0Min || amount1 < params.amount1Min) revert AmountError();
+
+    uint256 size = ILendgine(lendgine).deposit(
+      address(this),
+      params.liquidity,
+      abi.encode(
+        PairMintCallbackData({
+          token0: params.token0,
+          token1: params.token1,
+          strike: params.strike,
+          amount0: amount0,
+          amount1: amount1,
+          payer: msg.sender
+        })
+      )
+    );
+    if (size < params.sizeMin) revert AmountError();
+
+    Position.Info memory position = userPositions[params.recipient][lendgine];
+
+    (, uint256 rewardPerPositionPaid, ) = ILendgine(lendgine).positions(address(this));
+    position.tokensOwed += FullMath.mulDiv(position.size, rewardPerPositionPaid - position.rewardPerPositionPaid, 1e18);
+    position.rewardPerPositionPaid = rewardPerPositionPaid;
+    position.size += size;
+
+    userPositions[params.recipient][lendgine] = position;
+
+    emit AddLiquidity(msg.sender, lendgine, params.liquidity, size, amount0, amount1, params.recipient);
+  }
+
+  struct RemoveLiquidityParams {
+    address token0;
+    address token1;
+    uint256 strike;
+    uint256 size;
+    uint256 amount0Min;
+    uint256 amount1Min;
+    address recipient;
+    uint256 deadline;
+  }
+
+  function removeLiquidity(RemoveLiquidityParams calldata params) external checkDeadline(params.deadline) {
+    address lendgine = LendgineAddress.computeAddress(factory, params.token0, params.token1, params.strike);
+
+    address recipient = params.recipient == address(0) ? address(this) : params.recipient;
+
+    (uint256 amount0, uint256 amount1, uint256 liquidity) = ILendgine(lendgine).withdraw(recipient, params.size);
+    if (amount0 < params.amount0Min || amount1 < params.amount1Min) revert AmountError();
+
+    Position.Info memory position = userPositions[msg.sender][lendgine];
+
+    (, uint256 rewardPerPositionPaid, ) = ILendgine(lendgine).positions(address(this));
+    position.tokensOwed += FullMath.mulDiv(position.size, rewardPerPositionPaid - position.rewardPerPositionPaid, 1e18);
+    position.rewardPerPositionPaid = rewardPerPositionPaid;
+    position.size -= params.size;
+
+    userPositions[msg.sender][lendgine] = position;
+
+    emit RemoveLiquidity(msg.sender, lendgine, liquidity, params.size, amount0, amount1, recipient);
+  }
+
+  struct CollectParams {
+    address lendgine;
+    address recipient;
+    uint256 amountRequested;
+  }
+
+  function collect(CollectParams calldata params) external returns (uint256 amount) {
+    ILendgine(params.lendgine).accruePositionInterest();
+
+    address recipient = params.recipient == address(0) ? address(this) : params.recipient;
+
+    Position.Info memory position = userPositions[msg.sender][params.lendgine];
+
+    (, uint256 rewardPerPositionPaid, ) = ILendgine(params.lendgine).positions(address(this));
+    position.tokensOwed += FullMath.mulDiv(position.size, rewardPerPositionPaid - position.rewardPerPositionPaid, 1e18);
+    position.rewardPerPositionPaid = rewardPerPositionPaid;
+
+    amount = params.amountRequested > position.tokensOwed ? position.tokensOwed : params.amountRequested;
+    position.tokensOwed -= amount;
+
+    userPositions[msg.sender][params.lendgine] = position;
+
+    uint256 collectAmount = ILendgine(params.lendgine).collect(recipient, amount);
+    if (collectAmount != amount) revert CollectError();
+
+    emit Collect(msg.sender, recipient, amount);
   }
 
   /*//////////////////////////////////////////////////////////////
                             ACCOUNTING LOGIC
     //////////////////////////////////////////////////////////////*/
 
-  /// @inheritdoc ILendgine
   function convertLiquidityToShare(uint256 liquidity) public view override returns (uint256) {
     uint256 _totalLiquidityBorrowed = totalLiquidityBorrowed; // SLOAD
-    return _totalLiquidityBorrowed == 0 ? liquidity : FullMath.mulDiv(liquidity, totalSupply, _totalLiquidityBorrowed);
+    if (_totalLiquidityBorrowed == 0) {
+      return liquidity;
+    } else {
+      UD60x18 udLiquidity = ud(liquidity);
+      UD60x18 udTotalSupply = ud(totalSupply);
+      UD60x18 udTotalLiquidityBorrowed = ud(_totalLiquidityBorrowed);
+
+      UD60x18 result = mul(udLiquidity, div(udTotalSupply, udTotalLiquidityBorrowed));
+
+      return result.unwrap();
+    }
   }
 
-  /// @inheritdoc ILendgine
   function convertShareToLiquidity(uint256 shares) public view override returns (uint256) {
-    return FullMath.mulDiv(totalLiquidityBorrowed, shares, totalSupply);
+    UD60x18 udShares = ud(shares);
+    UD60x18 udTotalSupply = ud(totalSupply);
+    UD60x18 udTotalLiquidityBorrowed = ud(totalLiquidityBorrowed);
+
+    UD60x18 result = mul(udTotalLiquidityBorrowed, div(udShares, udTotalSupply));
+
+    return result.unwrap();
   }
 
-  /// @inheritdoc ILendgine
   function convertCollateralToLiquidity(uint256 collateral) public view override returns (uint256) {
-    return FullMath.mulDiv(collateral * token1Scale, 1e18, 2 * upperBound);
+    UD60x18 udCollateral = ud(collateral);
+    UD60x18 udStrike = ud(strike);
+    UD60x18 two = ud(2e18);
+
+    UD60x18 result = div(udCollateral, mul(two, udStrike));
+
+    return result.unwrap();
   }
 
-  /// @inheritdoc ILendgine
   function convertLiquidityToCollateral(uint256 liquidity) public view override returns (uint256) {
-    return FullMath.mulDiv(liquidity, 2 * upperBound, 1e18) / token1Scale;
+    UD60x18 udLiquidity = ud(liquidity);
+    UD60x18 udStrike = ud(strike);
+    UD60x18 two = ud(2e18);
+
+    UD60x18 result = mul(udLiquidity, mul(two, udStrike));
+
+    return result.unwrap();
   }
 
   /*//////////////////////////////////////////////////////////////
                          INTERNAL INTEREST LOGIC
     //////////////////////////////////////////////////////////////*/
 
-  /// @notice Helper function for accruing lendgine interest
   function _accrueInterest() private {
     if (totalSupply == 0 || totalLiquidityBorrowed == 0) {
       lastUpdate = block.timestamp;
@@ -260,9 +318,6 @@ contract Lendgine is ERC20, JumpRate, Pair, ILendgine {
     emit AccrueInterest(timeElapsed, dilutionSpeculative, dilutionLP);
   }
 
-  /// @notice Helper function for accruing interest to a position
-  /// @dev Assume the global interest is up to date
-  /// @param owner The address that this position belongs to
   function _accruePositionInterest(address owner) private {
     uint256 _rewardPerPositionStored = rewardPerPositionStored; // SLOAD
 
@@ -270,4 +325,61 @@ contract Lendgine is ERC20, JumpRate, Pair, ILendgine {
 
     emit AccruePositionInterest(owner, _rewardPerPositionStored);
   }
+
+  // constructor() payable override(ERC20, ImmutableState, Payment) {}
+
+  // function kink() external view override returns (uint256 kink) {}
+
+  // function multiplier() external view override returns (uint256 multiplier) {}
+
+  // function jumpMultiplier() external view override returns (uint256 jumpMultiplier) {}
+
+  // function factory() external view override returns (address) {}
+
+  // function token0() external view override returns (address) {}
+
+  // function token1() external view override returns (address) {}
+
+  // function strike() external view override returns (uint256) {}
+
+  // function reserve0() external view override returns (uint120) {}
+
+  // function reserve1() external view override returns (uint120) {}
+
+  // function totalLiquidity() external view override returns (uint256) {}
+
+  // function positions(address) external view override returns (uint256, uint256, uint256) {}
+
+  // function totalPositionSize() external view override returns (uint256) {}
+
+  // function totalLiquidityBorrowed() external view override returns (uint256) {}
+
+  // function rewardPerPositionStored() external view override returns (uint256) {}
+
+  // function lastUpdate() external view override returns (uint256) {}
+
+  function mint(address to, uint256 collateral, bytes calldata data) external override returns (uint256 shares) {}
+
+  function burn(address to, bytes calldata data) external override returns (uint256 collateral) {}
+
+  function deposit(address to, uint256 liquidity, bytes calldata data) external override returns (uint256 size) {}
+
+  function withdraw(
+    address to,
+    uint256 size
+  ) external override returns (uint256 amount0, uint256 amount1, uint256 liquidity) {}
+
+  function accrueInterest() external override {}
+
+  function accruePositionInterest() external override {}
+
+  function collect(address to, uint256 collateralRequested) external override returns (uint256 collateral) {}
+
+  function mintCallback(
+    uint256 collateral,
+    uint256 amount0,
+    uint256 amount1,
+    uint256 liquidity,
+    bytes calldata data
+  ) external override {}
 }
