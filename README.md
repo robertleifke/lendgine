@@ -9,9 +9,7 @@
 [license]: https://opensource.org/licenses/MIT
 [license-badge]: https://img.shields.io/badge/License-MIT-blue.svg
 
----
 Enables the lendging and borrowing of LP shares. Inherits jump rate, and immutable state.
----
 
 ## Code
 
