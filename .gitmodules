@@ -1,0 +1,3 @@
+[submodule "lib/rmm-core"]
+	path = lib/rmm-core
+	url = https://github.com/primitivefinance/rmm-core

@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 pragma solidity ^0.8.4;
 
-import { ERC20 } from "./ERC20.sol";
-import { JumpRate } from "./JumpRate.sol";
-import { Pair } from "./Pair.sol";
+// import { ERC20 } from "./ERC20.sol";
+// import { JumpRate } from "./JumpRate.sol";
 
-import { ILendgine } from "./interfaces/ILendgine.sol";
-import { IMintCallback } from "./interfaces/callback/IMintCallback.sol";
-import { IPairMintCallback } from "./interfaces/callback/IPairMintCallback.sol";
+import {PrimitiveEngine} from "lib/rmm-core/contracts/PrimitiveEngine.sol";
 
-import { Balance } from "../libraries/Balance.sol";
-import { FullMath } from "../libraries/FullMath.sol";
-import { Position } from "./libraries/Position.sol";
-import { SafeTransferLib } from "../libraries/SafeTransferLib.sol";
-import { Payment } from "./Payment.sol";
-import { SafeCast } from "../libraries/SafeCast.sol";
-import { LendgineAddress } from "./libraries/LendgineAddress.sol";
-import { UD60x18, ud, mul, div, pow, sub } from "@prb/math/src/UD60x18.sol";
+import {ILendgine} from "./interfaces/ILendgine.sol";
+import {IMintCallback} from "./interfaces/callback/IMintCallback.sol";
+import {IPairMintCallback} from "./interfaces/callback/IPairMintCallback.sol";
 
-contract Lendgine is ERC20, JumpRate, Pair, ILendgine, IMintCallback, IPairMintCallback, Payment {
+
+contract Lendgine is ERC20, JumpRate, RMM, ILendgine, IMintCallback, IPairMintCallback, Payment {
   using Position for mapping(address => Position.Info);
   using Position for Position.Info;
 
@@ -47,8 +40,8 @@ contract Lendgine is ERC20, JumpRate, Pair, ILendgine, IMintCallback, IPairMintC
     address indexed lendgine,
     uint256 liquidity,
     uint256 size,
-    uint256 amount0,
-    uint256 amount1,
+    uint256 amountX,
+    uint256 amountY,
     address indexed to
   );
 
@@ -99,11 +92,13 @@ contract Lendgine is ERC20, JumpRate, Pair, ILendgine, IMintCallback, IPairMintC
     //////////////////////////////////////////////////////////////*/
 
   struct PairMintCallbackData {
-    address token0;
-    address token1;
+    address tokenX;
+    address tokenY;
     uint256 strike;
-    uint256 amount0;
-    uint256 amount1;
+    uint256 sigma;
+    uint256 tau;
+    uint256 amountX;
+    uint256 amountY;
     address payer;
   }
 
@@ -122,12 +117,14 @@ contract Lendgine is ERC20, JumpRate, Pair, ILendgine, IMintCallback, IPairMintC
     //////////////////////////////////////////////////////////////*/
 
   struct AddLiquidityParams {
-    address token0;
-    address token1;
+    address tokenY;
+    address tokenX;
     uint256 strike;
+    uint256 sigma;
+    uint256 tau;
     uint256 liquidity;
-    uint256 amount0Min;
-    uint256 amount1Min;
+    uint256 amountYMin;
+    uint256 amountXMin;
     uint256 sizeMin;
     address recipient;
     uint256 deadline;
